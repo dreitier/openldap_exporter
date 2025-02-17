@@ -378,7 +378,7 @@ func (s *Scraper) Start(ctx context.Context) {
 	s.log = log.With("component", "scraper")
 	s.addReplicationQueries()
 	address := fmt.Sprintf("%s://%s:%d", s.Net, s.Host, s.Port)
-	s.log.Info("starting monitor loop", "addr", address)
+	s.log.Info("starting monitor loop", "addr", address, "TLS", s.UseTLS)
 	ticker := time.NewTicker(s.Tick)
 	defer ticker.Stop()
 	for {
