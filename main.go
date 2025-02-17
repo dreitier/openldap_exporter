@@ -445,12 +445,12 @@ func (s *Scraper) scrape() {
 	var err error
 	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
 	if s.UseTLS {
-		conn, err = ldap.Dial(s.Net, addr)
-	} else {
 		conn, err = ldap.DialTLS(s.Net, addr, &tls.Config{
 			ServerName:         s.Host,
 			InsecureSkipVerify: s.TLSSkipVerify,
 		})
+	} else {
+		conn, err = ldap.Dial(s.Net, addr)
 	}
 
 	if err != nil {
