@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	log "log/slog"
@@ -13,12 +14,10 @@ import (
 	"syscall"
 	"time"
 
-	kitlog "github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/tomcz/gotools/errgroup"
-	"github.com/tomcz/gotools/maps"
 	"github.com/tomcz/gotools/quiet"
 	"github.com/urfave/cli/v2"
 	"github.com/urfave/cli/v2/altsrc"
@@ -28,7 +27,10 @@ import (
 const (
 	promAddr          = "promAddr"
 	ldapNet           = "ldapNet"
-	ldapAddr          = "ldapAddr"
+	ldapHost          = "ldapHost"
+	ldapPort          = "ldapPort"
+	ldapTLS           = "ldapTLS"
+	ldapTLSSkipVerify = "ldapTLSSkipVerify"
 	ldapUser          = "ldapUser"
 	ldapPass          = "ldapPass"
 	interval          = "interval"
@@ -62,10 +64,28 @@ func main() {
 			EnvVars: []string{"LDAP_NET"},
 		}),
 		altsrc.NewStringFlag(&cli.StringFlag{
-			Name:    ldapAddr,
-			Value:   "localhost:389",
-			Usage:   "Address and port of OpenLDAP server",
-			EnvVars: []string{"LDAP_ADDR"},
+			Name:    ldapHost,
+			Value:   "tcp",
+			Usage:   "Hostname of OpenLDAP server",
+			EnvVars: []string{"LDAP_HOST"},
+		}),
+		altsrc.NewIntFlag(&cli.IntFlag{
+			Name:    ldapPort,
+			Value:   389,
+			Usage:   "Port of OpenLDAP server",
+			EnvVars: []string{"LDAP_PORT"},
+		}),
+		altsrc.NewBoolFlag(&cli.BoolFlag{
+			Name:    ldapTLS,
+			Value:   false,
+			Usage:   "Whether to use UseTLS encryption when  connecting to OpenLDAP server",
+			EnvVars: []string{"LDAP_TLS"},
+		}),
+		altsrc.NewBoolFlag(&cli.BoolFlag{
+			Name:    ldapTLSSkipVerify,
+			Value:   false,
+			Usage:   "Whether to skip verification of the X.509 certificate presented by the OpenLDAP server",
+			EnvVars: []string{"LDAP_TLS_SKIP_VERIFY"},
 		}),
 		altsrc.NewStringFlag(&cli.StringFlag{
 			Name:    ldapUser,
@@ -147,12 +167,15 @@ func runMain(c *cli.Context) error {
 	)
 
 	scraper := &Scraper{
-		Net:  c.String(ldapNet),
-		Addr: c.String(ldapAddr),
-		User: c.String(ldapUser),
-		Pass: c.String(ldapPass),
-		Tick: c.Duration(interval),
-		Sync: c.StringSlice(replicationObject),
+		Host:          c.String(ldapHost),
+		Port:          c.Int(ldapPort),
+		UseTLS:        c.Bool(ldapTLS),
+		TLSSkipVerify: c.Bool(ldapTLSSkipVerify),
+		Net:           c.String(ldapNet),
+		User:          c.String(ldapUser),
+		Pass:          c.String(ldapPass),
+		Tick:          c.Duration(interval),
+		Sync:          c.StringSlice(replicationObject),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -338,20 +361,23 @@ func setValue(entries []*ldap.Entry, q *query) {
 }
 
 type Scraper struct {
-	Net      string
-	Addr     string
-	User     string
-	Pass     string
-	Tick     time.Duration
-	LdapSync []string
-	log      *log.Logger
-	Sync     []string
+	Host          string
+	Port          int
+	Net           string
+	UseTLS        bool
+	TLSSkipVerify bool
+	User          string
+	Pass          string
+	Tick          time.Duration
+	LdapSync      []string
+	log           *log.Logger
+	Sync          []string
 }
 
 func (s *Scraper) Start(ctx context.Context) {
 	s.log = log.With("component", "scraper")
 	s.addReplicationQueries()
-	address := fmt.Sprintf("%s://%s", s.Net, s.Addr)
+	address := fmt.Sprintf("%s://%s:%d", s.Net, s.Host, s.Port)
 	s.log.Info("starting monitor loop", "addr", address)
 	ticker := time.NewTicker(s.Tick)
 	defer ticker.Stop()
@@ -415,7 +441,18 @@ func (s *Scraper) setReplicationValue(entries []*ldap.Entry, q *query) {
 }
 
 func (s *Scraper) scrape() {
-	conn, err := ldap.Dial(s.Net, s.Addr)
+	var conn *ldap.Conn
+	var err error
+	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
+	if s.UseTLS {
+		conn, err = ldap.Dial(s.Net, addr)
+	} else {
+		conn, err = ldap.DialTLS(s.Net, addr, &tls.Config{
+			ServerName:         s.Host,
+			InsecureSkipVerify: s.TLSSkipVerify,
+		})
+	}
+
 	if err != nil {
 		s.log.Error("dial failed")
 		dialCounter.WithLabelValues("fail").Inc()
@@ -491,12 +528,18 @@ func showVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprintln(w, GetVersion())
+	_, _ = fmt.Fprintln(w, GetVersion())
 }
 
 func (s *Server) Start() error {
 	s.logger.Info("starting http listener", "addr", s.server.Addr)
-	err := web.ListenAndServe(s.server, s.cfgPath, kitlog.LoggerFunc(s.adaptor))
+	var addr = []string{s.server.Addr}
+	flags := web.FlagConfig{
+		WebListenAddresses: &addr,
+		WebSystemdSocket:   nil,
+		WebConfigFile:      &s.cfgPath,
+	}
+	err := web.ListenAndServe(s.server, &flags, s.logger)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -505,44 +548,4 @@ func (s *Server) Start() error {
 
 func (s *Server) Stop() {
 	quiet.CloseWithTimeout(s.server.Shutdown, 100*time.Millisecond)
-}
-
-func (s *Server) adaptor(kvs ...interface{}) error {
-	if len(kvs) == 0 {
-		return nil
-	}
-	if len(kvs)%2 != 0 {
-		kvs = append(kvs, nil)
-	}
-	fields := make(map[string]any)
-	for i := 0; i < len(kvs); i += 2 {
-		key := fmt.Sprint(kvs[i])
-		fields[key] = kvs[i+1]
-	}
-	var msg string
-	if val, ok := fields["msg"]; ok {
-		delete(fields, "msg")
-		msg = fmt.Sprint(val)
-	}
-	var level string
-	if val, ok := fields["level"]; ok {
-		delete(fields, "level")
-		level = fmt.Sprint(val)
-	}
-	var args []any
-	for _, e := range maps.SortedEntries(fields) {
-		args = append(args, e.Key, e.Val)
-	}
-	ll := s.logger.With(args...)
-	switch level {
-	case "error":
-		ll.Error(msg)
-	case "warn":
-		ll.Warn(msg)
-	case "debug":
-		ll.Debug(msg)
-	default:
-		ll.Info(msg)
-	}
-	return nil
 }
